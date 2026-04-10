@@ -287,26 +287,17 @@ st.set_page_config(
 # Sidebar
 # ---------------------------------------------------------------------------
 
-_secrets_key = st.secrets.get("GOOGLE_API_KEY", "")
+api_key = st.secrets.get("GOOGLE_API_KEY", "")
 
 with st.sidebar:
     st.header("⚙️ Configuration")
-    if _secrets_key:
-        api_key = _secrets_key
-        st.success("API key configured", icon="🔑")
-    else:
-        api_key = st.text_input(
-            "Google AI API Key",
-            type="password",
-            help="Your Gemini API key from Google AI Studio.",
-        )
-    num_rounds = st.slider("Debate Rounds", min_value=1, max_value=3, value=2)
     model_name = st.radio(
         "Model",
         options=["gemini-2.5-flash", "gemini-2.5-pro"],
         horizontal=True,
         help="Flash is faster; Pro provides deeper analysis.",
     )
+    num_rounds = st.slider("Debate Rounds", min_value=1, max_value=3, value=2)
 
     st.divider()
     st.subheader("How it works")
@@ -375,9 +366,7 @@ if clear_history:
 
 if start_debate:
     if not api_key:
-        st.error(
-            "No API key found. Add it to Streamlit secrets or the sidebar."
-        )
+        st.error("API key not configured. Contact the app administrator.")
         st.stop()
     if not scenario.strip():
         st.warning("Please describe a client scenario to debate.")
