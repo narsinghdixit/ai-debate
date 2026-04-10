@@ -1,5 +1,6 @@
+from google import genai
+from google.genai import types
 import streamlit as st
-import google.generativeai as genai
 import time
 from datetime import datetime
 
@@ -180,10 +181,43 @@ def _build_synthesis_prompt(scenario: str, history: list[dict]) -> str:
     return "\n\n".join(parts)
 
 
-def _stream_chunks(model: genai.GenerativeModel, prompt: str):
+def _build_refinement_prompt(
+    scenario: str,
+    history: list[dict],
+    current_synthesis: str,
+    directive: str,
+) -> str:
+    """Assemble a prompt that asks the Synthesizer to revise its
+    recommendation based on a user-provided directive."""
+    parts = [f"## Client Scenario\n{scenario}", "## Full Debate Transcript"]
+    for entry in history:
+        agent = AGENTS[entry["role"]]
+        parts.append(f"**{entry['role']} ({agent['title']}):**\n{entry['content']}")
+    parts.append(f"## Your Previous Recommendation\n{current_synthesis}")
+    parts.append(
+        f"## Refinement Request\n"
+        f"The advisor has requested: {directive}\n\n"
+        "Revise your recommendation to incorporate this feedback. "
+        "Maintain your standard format (Key Risks Acknowledged / "
+        "Opportunities Worth Pursuing / Recommended 3-Step Action Plan)."
+    )
+    return "\n\n".join(parts)
+
+
+def _stream_chunks(
+    client: genai.Client,
+    model_name: str,
+    prompt: str,
+    system_instruction: str,
+):
     """Yield text chunks from a streaming Gemini response."""
-    response = model.generate_content(prompt, stream=True)
-    for chunk in response:
+    for chunk in client.models.generate_content_stream(
+        model=model_name,
+        contents=prompt,
+        config=types.GenerateContentConfig(
+            system_instruction=system_instruction,
+        ),
+    ):
         if chunk.text:
             yield chunk.text
 
@@ -191,9 +225,8 @@ def _stream_chunks(model: genai.GenerativeModel, prompt: str):
 def _validate_api_key(api_key: str, model_name: str) -> tuple[bool, str]:
     """Fast-fail validation with a lightweight token-counting call."""
     try:
-        genai.configure(api_key=api_key)
-        model = genai.GenerativeModel(model_name)
-        model.count_tokens("connection test")
+        client = genai.Client(api_key=api_key)
+        client.models.count_tokens(model=model_name, contents="connection test")
         return True, ""
     except Exception as exc:
         return False, str(exc)
@@ -273,6 +306,41 @@ def _render_entry(entry: dict) -> None:
             st.caption(f"Responded in {entry['elapsed']:.1f}s")
 
 
+def _render_post_debate_ui(key_prefix: str, transcript: str) -> None:
+    """Render download, refinement input, and New Debate button."""
+    st.download_button(
+        label="📥 Download Full Transcript (.md)",
+        data=transcript,
+        file_name=f"debate_transcript_{datetime.now():%Y%m%d_%H%M%S}.md",
+        mime="text/markdown",
+        use_container_width=True,
+        key=f"{key_prefix}_download",
+    )
+
+    if st.session_state.synthesis:
+        st.caption("Want adjustments? Describe what to change below.")
+        refine_col, btn_col = st.columns([4, 1])
+        refine_text = refine_col.text_input(
+            "Refinement directive",
+            placeholder="e.g., 'make step 2 more conservative' or 'add tax implications'",
+            label_visibility="collapsed",
+            key=f"{key_prefix}_refine_input",
+        )
+        if btn_col.button("🔄 Refine", use_container_width=True, key=f"{key_prefix}_refine_btn"):
+            if refine_text.strip():
+                st.session_state.pending_refinement = refine_text.strip()
+                st.rerun()
+            else:
+                st.warning("Enter a refinement directive.")
+
+    if st.button("✨ Start New Debate", use_container_width=True, key=f"{key_prefix}_new"):
+        st.session_state.debate_history = []
+        st.session_state.synthesis = None
+        st.session_state.scenario = ""
+        st.session_state.pending_refinement = ""
+        st.rerun()
+
+
 # ---------------------------------------------------------------------------
 # Page Configuration
 # ---------------------------------------------------------------------------
@@ -307,7 +375,7 @@ with st.sidebar:
         "3. **Agent B** 🚀 counters with growth strategies.\n"
         "4. They debate for the chosen number of rounds.\n"
         "5. **Advisor** ⚖️ synthesizes a balanced recommendation.\n"
-        "6. Download the full transcript as Markdown."
+        "6. Refine the synthesis or download the transcript."
     )
 
 # ---------------------------------------------------------------------------
@@ -319,6 +387,7 @@ _DEFAULTS: dict = {
     "synthesis": None,
     "scenario": "",
     "model_used": "gemini-2.5-flash",
+    "pending_refinement": "",
 }
 for _k, _v in _DEFAULTS.items():
     if _k not in st.session_state:
@@ -337,11 +406,19 @@ template_choice = st.selectbox(
 )
 template_text = SCENARIO_TEMPLATES[template_choice]
 
+has_history = bool(st.session_state.debate_history)
+if has_history and st.session_state.scenario:
+    scenario_default = st.session_state.scenario
+    scenario_key = "scenario_area_replay"
+else:
+    scenario_default = template_text
+    scenario_key = f"scenario_area_{template_choice}"
+
 scenario = st.text_area(
     "Client Scenario",
-    value=template_text,
+    value=scenario_default,
     height=130,
-    key=f"scenario_area_{template_choice}",
+    key=scenario_key,
     placeholder=(
         "Describe the client's situation: age, net worth, holdings, goals, "
         "risk tolerance, time horizon, and any specific concerns…"
@@ -358,6 +435,7 @@ if clear_history:
     st.session_state.debate_history = []
     st.session_state.synthesis = None
     st.session_state.scenario = ""
+    st.session_state.pending_refinement = ""
     st.rerun()
 
 # ---------------------------------------------------------------------------
@@ -385,6 +463,7 @@ if start_debate:
     st.session_state.synthesis = None
     st.session_state.scenario = scenario
     st.session_state.model_used = model_name
+    st.session_state.pending_refinement = ""
 
     st.divider()
 
@@ -393,41 +472,40 @@ if start_debate:
     progress = st.progress(0, text="Starting debate…")
 
     try:
-        genai.configure(api_key=api_key)
+        client = genai.Client(api_key=api_key)
 
         # ── Debate rounds ────────────────────────────────────────────────
         for round_idx in range(num_rounds):
             st.subheader(f"Round {round_idx + 1} of {num_rounds}")
 
-            for role in DEBATE_AGENTS:
-                agent = AGENTS[role]
-                current_step += 1
-                progress.progress(
-                    current_step / total_steps,
-                    text=(
-                        f"Round {round_idx + 1}/{num_rounds} · "
-                        f"{agent['title']} responding…"
-                    ),
-                )
+            with st.container(border=True):
+                for role in DEBATE_AGENTS:
+                    agent = AGENTS[role]
+                    current_step += 1
+                    progress.progress(
+                        current_step / total_steps,
+                        text=(
+                            f"Round {round_idx + 1}/{num_rounds} · "
+                            f"{agent['title']} responding…"
+                        ),
+                    )
 
-                model = genai.GenerativeModel(
-                    model_name=model_name,
-                    system_instruction=agent["system_instruction"],
-                )
-                prompt = _build_debate_prompt(
-                    role, scenario, st.session_state.debate_history
-                )
+                    prompt = _build_debate_prompt(
+                        role, scenario, st.session_state.debate_history
+                    )
 
-                with st.chat_message(role, avatar=agent["avatar"]):
-                    st.markdown(f"**{role}** · *{agent['title']}*")
-                    t0 = time.time()
-                    full_text = st.write_stream(_stream_chunks(model, prompt))
-                    elapsed = time.time() - t0
-                    st.caption(f"Responded in {elapsed:.1f}s")
+                    with st.chat_message(role, avatar=agent["avatar"]):
+                        st.markdown(f"**{role}** · *{agent['title']}*")
+                        t0 = time.time()
+                        full_text = st.write_stream(
+                            _stream_chunks(client, model_name, prompt, agent["system_instruction"])
+                        )
+                        elapsed = time.time() - t0
+                        st.caption(f"Responded in {elapsed:.1f}s")
 
-                st.session_state.debate_history.append(
-                    {"role": role, "content": full_text, "elapsed": elapsed}
-                )
+                    st.session_state.debate_history.append(
+                        {"role": role, "content": full_text, "elapsed": elapsed}
+                    )
 
         # ── Synthesis ────────────────────────────────────────────────────
         st.divider()
@@ -436,10 +514,6 @@ if start_debate:
         progress.progress(current_step / total_steps, text="Synthesizing recommendation…")
 
         synth_agent = AGENTS["Synthesis"]
-        synth_model = genai.GenerativeModel(
-            model_name=model_name,
-            system_instruction=synth_agent["system_instruction"],
-        )
         synth_prompt = _build_synthesis_prompt(
             scenario, st.session_state.debate_history
         )
@@ -447,7 +521,9 @@ if start_debate:
         with st.chat_message("Synthesis", avatar=synth_agent["avatar"]):
             st.markdown(f"**Synthesis** · *{synth_agent['title']}*")
             t0 = time.time()
-            synth_text = st.write_stream(_stream_chunks(synth_model, synth_prompt))
+            synth_text = st.write_stream(
+                _stream_chunks(client, model_name, synth_prompt, synth_agent["system_instruction"])
+            )
             elapsed = time.time() - t0
             st.caption(f"Responded in {elapsed:.1f}s")
 
@@ -469,22 +545,16 @@ if start_debate:
             num_rounds,
             model_name,
         )
-        st.download_button(
-            label="📥 Download Full Transcript (.md)",
-            data=transcript,
-            file_name=f"debate_transcript_{datetime.now():%Y%m%d_%H%M%S}.md",
-            mime="text/markdown",
-            use_container_width=True,
-        )
+        _render_post_debate_ui("live", transcript)
 
-    except genai.types.BlockedPromptException:
-        st.error(
-            "The prompt was blocked by the model's safety filters. "
-            "Try rephrasing the scenario."
-        )
     except Exception as exc:
         msg = str(exc)
-        if "quota" in msg.lower():
+        if "blocked" in msg.lower() or "safety" in msg.lower():
+            st.error(
+                "The prompt was blocked by the model's safety filters. "
+                "Try rephrasing the scenario."
+            )
+        elif "quota" in msg.lower():
             st.error("API quota exceeded. Please wait and try again later.")
         else:
             st.error(f"An error occurred: {msg}")
@@ -494,18 +564,52 @@ if start_debate:
 # ---------------------------------------------------------------------------
 
 elif st.session_state.debate_history:
-    if st.session_state.scenario:
-        st.info(f"**Scenario:** {st.session_state.scenario}")
+    pending = st.session_state.get("pending_refinement", "")
+    if pending:
+        st.session_state.pending_refinement = ""
 
     st.divider()
-    entries_per_round = len(DEBATE_AGENTS)
-    for i, entry in enumerate(st.session_state.debate_history):
-        if i % entries_per_round == 0:
-            round_num = (i // entries_per_round) + 1
-            st.subheader(f"Round {round_num}")
-        _render_entry(entry)
 
-    if st.session_state.synthesis:
+    entries_per_round = len(DEBATE_AGENTS)
+    total_rounds = len(st.session_state.debate_history) // entries_per_round
+
+    for round_idx in range(total_rounds):
+        st.subheader(f"Round {round_idx + 1}")
+        with st.container(border=True):
+            for j in range(entries_per_round):
+                _render_entry(st.session_state.debate_history[round_idx * entries_per_round + j])
+
+    # ── Synthesis (or refinement) ────────────────────────────────────
+    if pending and st.session_state.synthesis:
+        st.divider()
+        st.subheader("Revised Synthesis")
+        try:
+            client = genai.Client(api_key=api_key)
+            synth_agent = AGENTS["Synthesis"]
+            refine_prompt = _build_refinement_prompt(
+                st.session_state.scenario,
+                st.session_state.debate_history,
+                st.session_state.synthesis["content"],
+                pending,
+            )
+            with st.chat_message("Synthesis", avatar=synth_agent["avatar"]):
+                st.markdown(f"**Revised Synthesis** · *{synth_agent['title']}*")
+                t0 = time.time()
+                synth_text = st.write_stream(
+                    _stream_chunks(
+                        client,
+                        st.session_state.model_used,
+                        refine_prompt,
+                        synth_agent["system_instruction"],
+                    )
+                )
+                elapsed = time.time() - t0
+                st.caption(f"Responded in {elapsed:.1f}s")
+            st.session_state.synthesis = {"content": synth_text, "elapsed": elapsed}
+        except Exception as exc:
+            st.error(f"Refinement failed: {exc}")
+
+    elif st.session_state.synthesis:
         st.divider()
         st.subheader("Final Synthesis")
         synth = st.session_state.synthesis
@@ -516,8 +620,8 @@ elif st.session_state.debate_history:
             if "elapsed" in synth:
                 st.caption(f"Responded in {synth['elapsed']:.1f}s")
 
+    # ── Completion & export ──────────────────────────────────────────
     st.divider()
-    total_rounds = len(st.session_state.debate_history) // entries_per_round
     st.success(
         f"Debate complete — {total_rounds} round(s), "
         f"{len(st.session_state.debate_history)} exchanges + final synthesis."
@@ -530,13 +634,7 @@ elif st.session_state.debate_history:
         total_rounds,
         st.session_state.model_used,
     )
-    st.download_button(
-        label="📥 Download Full Transcript (.md)",
-        data=transcript,
-        file_name=f"debate_transcript_{datetime.now():%Y%m%d_%H%M%S}.md",
-        mime="text/markdown",
-        use_container_width=True,
-    )
+    _render_post_debate_ui("replay", transcript)
 
 # ---------------------------------------------------------------------------
 # Footer Disclaimer
