@@ -350,7 +350,7 @@ def _build_transcript_pdf(
         "professional before making investment decisions.",
     )
 
-    return pdf.output()
+    return bytes(pdf.output())
 
 
 def _render_entry(entry: dict) -> None:
