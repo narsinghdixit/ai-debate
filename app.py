@@ -287,13 +287,19 @@ st.set_page_config(
 # Sidebar
 # ---------------------------------------------------------------------------
 
+_secrets_key = st.secrets.get("GOOGLE_API_KEY", "")
+
 with st.sidebar:
     st.header("⚙️ Configuration")
-    api_key = st.text_input(
-        "Google AI API Key",
-        type="password",
-        help="Your Gemini API key from Google AI Studio.",
-    )
+    if _secrets_key:
+        api_key = _secrets_key
+        st.success("API key configured", icon="🔑")
+    else:
+        api_key = st.text_input(
+            "Google AI API Key",
+            type="password",
+            help="Your Gemini API key from Google AI Studio.",
+        )
     num_rounds = st.slider("Debate Rounds", min_value=1, max_value=3, value=2)
     model_name = st.radio(
         "Model",
@@ -369,7 +375,9 @@ if clear_history:
 
 if start_debate:
     if not api_key:
-        st.error("Please enter your Google AI API key in the sidebar.")
+        st.error(
+            "No API key found. Add it to Streamlit secrets or the sidebar."
+        )
         st.stop()
     if not scenario.strip():
         st.warning("Please describe a client scenario to debate.")
