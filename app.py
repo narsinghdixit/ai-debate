@@ -2,7 +2,9 @@ from google import genai
 from google.genai import types
 import streamlit as st
 import time
+import re
 from datetime import datetime
+from fpdf import FPDF
 
 # ---------------------------------------------------------------------------
 # Agent Personas
@@ -204,6 +206,12 @@ def _build_refinement_prompt(
     return "\n\n".join(parts)
 
 
+def _escape_dollars(text: str) -> str:
+    """Escape bare $ signs so Streamlit's markdown renderer doesn't
+    interpret currency values like $250K as LaTeX math."""
+    return text.replace("$", r"\$")
+
+
 def _stream_chunks(
     client: genai.Client,
     model_name: str,
@@ -222,6 +230,17 @@ def _stream_chunks(
             yield chunk.text
 
 
+def _display_stream(generator) -> str:
+    """Stream text into the UI with dollar signs escaped for display.
+    Returns the raw (unescaped) text for storage."""
+    placeholder = st.empty()
+    raw_chunks: list[str] = []
+    for chunk in generator:
+        raw_chunks.append(chunk)
+        placeholder.markdown(_escape_dollars("".join(raw_chunks)))
+    return "".join(raw_chunks)
+
+
 def _validate_api_key(api_key: str, model_name: str) -> tuple[bool, str]:
     """Fast-fail validation with a lightweight token-counting call."""
     try:
@@ -232,67 +251,106 @@ def _validate_api_key(api_key: str, model_name: str) -> tuple[bool, str]:
         return False, str(exc)
 
 
-def _build_transcript(
+def _strip_markdown(text: str) -> str:
+    """Lightweight markdown-to-plain-text for PDF body content."""
+    text = re.sub(r"#{1,6}\s*", "", text)
+    text = re.sub(r"\*\*(.+?)\*\*", r"\1", text)
+    text = re.sub(r"(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)", r"\1", text)
+    for old, new in {
+        "\u2014": "--", "\u2013": "-", "\u201c": '"', "\u201d": '"',
+        "\u2018": "'", "\u2019": "'", "\u2022": "-", "\u2026": "...",
+    }.items():
+        text = text.replace(old, new)
+    return text.encode("latin-1", errors="replace").decode("latin-1")
+
+
+def _build_transcript_pdf(
     scenario: str,
     history: list[dict],
     synthesis: dict | None,
     num_rounds: int,
     model_name: str,
-) -> str:
-    """Build a formatted Markdown transcript for download."""
-    lines = [
-        "# Wealth Management Debate Transcript",
-        "",
-        f"**Date:** {datetime.now().strftime('%B %d, %Y at %I:%M %p')}  ",
-        f"**Model:** `{model_name}`  ",
-        f"**Debate Rounds:** {num_rounds}",
-        "",
-        "---",
-        "",
-        "## Client Scenario",
-        "",
-        scenario,
-        "",
-    ]
+) -> bytes:
+    """Build a clean, professional PDF transcript."""
+    pdf = FPDF()
+    pdf.set_auto_page_break(auto=True, margin=20)
+    pdf.add_page()
+
+    pdf.set_font("Helvetica", "B", 18)
+    pdf.cell(0, 10, "Wealth Management Debate Transcript", new_x="LMARGIN", new_y="NEXT", align="C")
+    pdf.ln(2)
+
+    pdf.set_font("Helvetica", "", 9)
+    pdf.set_text_color(120, 120, 120)
+    meta = (
+        f"Date: {datetime.now().strftime('%B %d, %Y at %I:%M %p')}  |  "
+        f"Model: {model_name}  |  Rounds: {num_rounds}"
+    )
+    pdf.cell(0, 5, meta, new_x="LMARGIN", new_y="NEXT", align="C")
+    pdf.set_text_color(0, 0, 0)
+    pdf.ln(6)
+    pdf.set_draw_color(200, 200, 200)
+    pdf.line(10, pdf.get_y(), 200, pdf.get_y())
+    pdf.ln(6)
+
+    pdf.set_font("Helvetica", "B", 13)
+    pdf.cell(0, 8, "Client Scenario", new_x="LMARGIN", new_y="NEXT")
+    pdf.ln(2)
+    pdf.set_font("Helvetica", "", 10)
+    pdf.multi_cell(0, 5, _strip_markdown(scenario))
+    pdf.ln(4)
 
     entries_per_round = len(DEBATE_AGENTS)
     for i, entry in enumerate(history):
         if i % entries_per_round == 0:
             round_num = (i // entries_per_round) + 1
-            lines += ["---", "", f"## Round {round_num}", ""]
+            pdf.line(10, pdf.get_y(), 200, pdf.get_y())
+            pdf.ln(5)
+            pdf.set_font("Helvetica", "B", 13)
+            pdf.cell(0, 8, f"Round {round_num}", new_x="LMARGIN", new_y="NEXT")
+            pdf.ln(2)
+
         agent = AGENTS[entry["role"]]
-        elapsed_tag = f" *({entry['elapsed']:.1f}s)*" if "elapsed" in entry else ""
-        lines += [
-            f"### {agent['avatar']} {entry['role']} · {agent['title']}{elapsed_tag}",
-            "",
-            entry["content"],
-            "",
-        ]
+        elapsed_tag = f"  ({entry['elapsed']:.1f}s)" if "elapsed" in entry else ""
+        pdf.set_font("Helvetica", "B", 11)
+        pdf.cell(
+            0, 7,
+            f"{entry['role']} - {agent['title']}{elapsed_tag}",
+            new_x="LMARGIN", new_y="NEXT",
+        )
+        pdf.ln(1)
+        pdf.set_font("Helvetica", "", 10)
+        pdf.multi_cell(0, 5, _strip_markdown(entry["content"]))
+        pdf.ln(4)
 
     if synthesis:
         synth_agent = AGENTS["Synthesis"]
-        elapsed_tag = (
-            f" *({synthesis['elapsed']:.1f}s)*" if "elapsed" in synthesis else ""
+        elapsed_tag = f"  ({synthesis['elapsed']:.1f}s)" if "elapsed" in synthesis else ""
+        pdf.line(10, pdf.get_y(), 200, pdf.get_y())
+        pdf.ln(5)
+        pdf.set_font("Helvetica", "B", 13)
+        pdf.cell(
+            0, 8,
+            f"Final Synthesis - {synth_agent['title']}{elapsed_tag}",
+            new_x="LMARGIN", new_y="NEXT",
         )
-        lines += [
-            "---",
-            "",
-            f"## {synth_agent['avatar']} Final Synthesis · {synth_agent['title']}{elapsed_tag}",
-            "",
-            synthesis["content"],
-            "",
-        ]
+        pdf.ln(2)
+        pdf.set_font("Helvetica", "", 10)
+        pdf.multi_cell(0, 5, _strip_markdown(synthesis["content"]))
+        pdf.ln(4)
 
-    lines += [
-        "---",
-        "",
-        (
-            "*AI-generated analysis for informational purposes only. "
-            "Not financial, legal, or tax advice. Consult a qualified "
-            "professional before making investment decisions.*"
-        ),
-    ]
-    return "\n".join(lines)
+    pdf.line(10, pdf.get_y(), 200, pdf.get_y())
+    pdf.ln(4)
+    pdf.set_font("Helvetica", "I", 8)
+    pdf.set_text_color(130, 130, 130)
+    pdf.multi_cell(
+        0, 4,
+        "AI-generated analysis for informational purposes only. "
+        "Not financial, legal, or tax advice. Consult a qualified "
+        "professional before making investment decisions.",
+    )
+
+    return pdf.output()
 
 
 def _render_entry(entry: dict) -> None:
@@ -301,18 +359,18 @@ def _render_entry(entry: dict) -> None:
     agent = AGENTS[role]
     with st.chat_message(role, avatar=agent["avatar"]):
         st.markdown(f"**{role}** · *{agent['title']}*")
-        st.markdown(entry["content"])
+        st.markdown(_escape_dollars(entry["content"]))
         if "elapsed" in entry:
             st.caption(f"Responded in {entry['elapsed']:.1f}s")
 
 
-def _render_post_debate_ui(key_prefix: str, transcript: str) -> None:
+def _render_post_debate_ui(key_prefix: str, pdf_data: bytes) -> None:
     """Render download, refinement input, and New Debate button."""
     st.download_button(
-        label="📥 Download Full Transcript (.md)",
-        data=transcript,
-        file_name=f"debate_transcript_{datetime.now():%Y%m%d_%H%M%S}.md",
-        mime="text/markdown",
+        label="📥 Download Transcript (PDF)",
+        data=pdf_data,
+        file_name=f"debate_transcript_{datetime.now():%Y%m%d_%H%M%S}.pdf",
+        mime="application/pdf",
         use_container_width=True,
         key=f"{key_prefix}_download",
     )
@@ -497,7 +555,7 @@ if start_debate:
                     with st.chat_message(role, avatar=agent["avatar"]):
                         st.markdown(f"**{role}** · *{agent['title']}*")
                         t0 = time.time()
-                        full_text = st.write_stream(
+                        full_text = _display_stream(
                             _stream_chunks(client, model_name, prompt, agent["system_instruction"])
                         )
                         elapsed = time.time() - t0
@@ -521,7 +579,7 @@ if start_debate:
         with st.chat_message("Synthesis", avatar=synth_agent["avatar"]):
             st.markdown(f"**Synthesis** · *{synth_agent['title']}*")
             t0 = time.time()
-            synth_text = st.write_stream(
+            synth_text = _display_stream(
                 _stream_chunks(client, model_name, synth_prompt, synth_agent["system_instruction"])
             )
             elapsed = time.time() - t0
@@ -538,14 +596,14 @@ if start_debate:
             f"{len(st.session_state.debate_history)} exchanges + final synthesis."
         )
 
-        transcript = _build_transcript(
+        pdf_data = _build_transcript_pdf(
             scenario,
             st.session_state.debate_history,
             st.session_state.synthesis,
             num_rounds,
             model_name,
         )
-        _render_post_debate_ui("live", transcript)
+        _render_post_debate_ui("live", pdf_data)
 
     except Exception as exc:
         msg = str(exc)
@@ -595,7 +653,7 @@ elif st.session_state.debate_history:
             with st.chat_message("Synthesis", avatar=synth_agent["avatar"]):
                 st.markdown(f"**Revised Synthesis** · *{synth_agent['title']}*")
                 t0 = time.time()
-                synth_text = st.write_stream(
+                synth_text = _display_stream(
                     _stream_chunks(
                         client,
                         st.session_state.model_used,
@@ -616,7 +674,7 @@ elif st.session_state.debate_history:
         synth_agent = AGENTS["Synthesis"]
         with st.chat_message("Synthesis", avatar=synth_agent["avatar"]):
             st.markdown(f"**Synthesis** · *{synth_agent['title']}*")
-            st.markdown(synth["content"])
+            st.markdown(_escape_dollars(synth["content"]))
             if "elapsed" in synth:
                 st.caption(f"Responded in {synth['elapsed']:.1f}s")
 
@@ -627,14 +685,14 @@ elif st.session_state.debate_history:
         f"{len(st.session_state.debate_history)} exchanges + final synthesis."
     )
 
-    transcript = _build_transcript(
+    pdf_data = _build_transcript_pdf(
         st.session_state.scenario,
         st.session_state.debate_history,
         st.session_state.synthesis,
         total_rounds,
         st.session_state.model_used,
     )
-    _render_post_debate_ui("replay", transcript)
+    _render_post_debate_ui("replay", pdf_data)
 
 # ---------------------------------------------------------------------------
 # Footer Disclaimer
